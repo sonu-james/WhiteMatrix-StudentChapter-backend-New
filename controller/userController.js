@@ -101,22 +101,19 @@ exports.loginController = async (req, res) => {
 const otpStore = {};
 
 function createTransporter() {
-  const host = process.env.SMTP_HOST || "smtp.gmail.com";
-  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
-  const secure = process.env.SMTP_SECURE === "true" ? true : (port === 465);
-
   return nodemailer.createTransport({
-    host,
-    port,
-    secure,
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: (process.env.SMTP_SECURE === "true"), // false for 587
     auth: {
       user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
+      pass: process.env.EMAIL_PASS, // app password
     },
+    tls: { rejectUnauthorized: false },
     pool: true,
-    connectionTimeout: 30_000,
-    greetingTimeout: 30_000,
-    socketTimeout: 60_000,
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
+    socketTimeout: 60000,
     logger: true,
     debug: true,
   });
@@ -124,46 +121,43 @@ function createTransporter() {
 
 exports.sendOtpController = async (req, res) => {
   try {
-    console.log("SEND-OTP request body:", req.body);
+    console.log("DEBUG SEND-OTP request body:", req.body);
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: "Email is required" });
 
     const user = await users.findOne({ email });
-    if (!user) return res.status(404).json({ message: "No account found with this email" });
+    if (!user) return res.status(404).json({ message: "No account found" });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-    // Save to in-memory for now (or call Redis helper if you already wired it)
     otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
 
     const transporter = createTransporter();
-
-    // **DO NOT** call transporter.verify() in production debug; try sendMail directly and capture error
     const mailOptions = {
       from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
       to: email,
-      subject: "Password Reset OTP - Student Chapter",
-      text: `Your OTP is: ${otp} (valid 5 minutes)`,
+      subject: "DEBUG OTP",
+      text: `Your DEBUG OTP is: ${otp}`,
     };
 
     try {
       const info = await transporter.sendMail(mailOptions);
-      console.log("sendMail success:", info);
-      return res.status(200).json({ message: "OTP sent successfully", debug: info });
+      console.log("DEBUG sendMail success:", info);
+      return res.status(200).json({ message: "OTP sent (DEBUG)", info });
     } catch (smtpErr) {
-      console.error("sendMail ERROR full:", smtpErr);
-      // Return detailed error to client for debugging (safe in private environment)
+      console.error("DEBUG sendMail ERROR full:", smtpErr);
+
+      // Return detailed diagnostic info (safe for debugging)
       return res.status(502).json({
-        message: "SMTP send failed",
-        error: String(smtpErr.message || smtpErr),
-        code: smtpErr.code || null,
-        response: smtpErr.response || null,
-        stack: smtpErr.stack || null
+        message: "SMTP send failed (DEBUG)",
+        errorMessage: smtpErr && smtpErr.message ? smtpErr.message : String(smtpErr),
+        code: smtpErr && smtpErr.code ? smtpErr.code : null,
+        response: smtpErr && smtpErr.response ? smtpErr.response : null,
+        stack: smtpErr && smtpErr.stack ? smtpErr.stack : null,
+        cmd: smtpErr && smtpErr.command ? smtpErr.command : null,
       });
     }
-
   } catch (err) {
-    console.error("SEND-OTP outer error:", err);
+    console.error("DEBUG sendOtpController outer error:", err);
     return res.status(500).json({ message: "Server error", error: String(err) });
   }
 };
