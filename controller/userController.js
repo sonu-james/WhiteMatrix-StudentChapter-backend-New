@@ -97,111 +97,176 @@ exports.loginController = async (req, res) => {
 };
 
 
-// Temporary in-memory store for OTPs (replace with Redis in prod)
-const otpStore = {};
+/// Temporary in-memory store for OTPs (replace with Redis in prod)
+const otpStore = {}; // { "<email>": { otp, expiresAt, verified } }
+
+// Transporter singleton
+let _transporter = null;
 
 function createTransporter() {
-  return nodemailer.createTransport({
+  if (_transporter) return _transporter;
+
+  const transportOptions = {
     host: process.env.SMTP_HOST || "smtp.gmail.com",
     port: Number(process.env.SMTP_PORT || 587),
-    secure: (process.env.SMTP_SECURE === "true"), // false for 587
+    secure: (process.env.SMTP_SECURE === "true"), // set "true" for 465
     auth: {
       user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS, // app password
+      pass: process.env.EMAIL_PASS, // app password or SMTP password
     },
-    tls: { rejectUnauthorized: false },
-    pool: true,
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 60000,
-    logger: true,
-    debug: true,
-  });
+    pool: true, // keep connections open and reuse
+    connectionTimeout: Number(process.env.SMTP_CONN_TIMEOUT) || 30000,
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT) || 30000,
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT) || 60000,
+    logger: (process.env.DEBUG_MAIL === "true"),
+    debug: (process.env.DEBUG_MAIL === "true"),
+  };
+
+  // only add TLS override if explicitly requested
+  if (process.env.SMTP_REJECT_UNAUTHORIZED === "false") {
+    transportOptions.tls = { rejectUnauthorized: false };
+  }
+
+  _transporter = nodemailer.createTransport(transportOptions);
+
+  // verify transporter on creation (logs appear only when DEBUG_MAIL=true)
+  _transporter.verify().then(
+    () => {
+      if (process.env.DEBUG_MAIL === "true") {
+        console.log("MAILER: transporter verified and ready.");
+      }
+    },
+    (err) => {
+      console.error("MAILER: transporter verification failed:", err && err.message ? err.message : err);
+    }
+  );
+
+  return _transporter;
 }
 
+// Utility: check if debug mode is on
+function isDebug() {
+  return process.env.DEBUG_MAIL === "true";
+}
+
+/**
+ * SEND OTP
+ */
 exports.sendOtpController = async (req, res) => {
   try {
-    console.log("DEBUG SEND-OTP request body:", req.body);
+    console.log("SEND-OTP request body:", { email: !!req.body.email });
+
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: "Email is required" });
 
     const user = await users.findOne({ email });
     if (!user) return res.status(404).json({ message: "No account found" });
 
+    // generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
+    otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000, verified: false };
 
     const transporter = createTransporter();
+
     const mailOptions = {
       from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
       to: email,
-      subject: "DEBUG OTP",
-      text: `Your DEBUG OTP is: ${otp}`,
+      subject: process.env.OTP_SUBJECT || "Your OTP Code",
+      text: `Your OTP is: ${otp}. It expires in 5 minutes.`,
+      // html: `<p>Your OTP is <strong>${otp}</strong>. It expires in 5 minutes.</p>`
     };
 
     try {
       const info = await transporter.sendMail(mailOptions);
-      console.log("DEBUG sendMail success:", info);
-      return res.status(200).json({ message: "OTP sent (DEBUG)", info });
-    } catch (smtpErr) {
-      console.error("DEBUG sendMail ERROR full:", smtpErr);
+      console.log("SEND-OTP success:", { messageId: info && info.messageId ? info.messageId : null });
 
-      // Return detailed diagnostic info (safe for debugging)
-      return res.status(502).json({
-        message: "SMTP send failed (DEBUG)",
-        errorMessage: smtpErr && smtpErr.message ? smtpErr.message : String(smtpErr),
-        code: smtpErr && smtpErr.code ? smtpErr.code : null,
-        response: smtpErr && smtpErr.response ? smtpErr.response : null,
-        stack: smtpErr && smtpErr.stack ? smtpErr.stack : null,
-        cmd: smtpErr && smtpErr.command ? smtpErr.command : null,
-      });
+      // respond lightly; include info only if debugging
+      const response = { message: "OTP sent" };
+      if (isDebug()) response.info = info;
+      return res.status(200).json(response);
+    } catch (smtpErr) {
+      console.error("SEND-OTP SMTP ERROR:", smtpErr && smtpErr.message ? smtpErr.message : smtpErr);
+
+      // Provide safe debug info only when DEBUG_MAIL=true
+      if (isDebug()) {
+        return res.status(502).json({
+          message: "SMTP send failed (DEBUG)",
+          errorMessage: smtpErr && smtpErr.message ? smtpErr.message : String(smtpErr),
+          code: smtpErr && smtpErr.code ? smtpErr.code : null,
+          response: smtpErr && smtpErr.response ? smtpErr.response : null,
+          stack: smtpErr && smtpErr.stack ? smtpErr.stack : null,
+        });
+      }
+
+      // production-safe response
+      return res.status(502).json({ message: "Failed to send OTP" });
     }
   } catch (err) {
-    console.error("DEBUG sendOtpController outer error:", err);
-    return res.status(500).json({ message: "Server error", error: String(err) });
+    console.error("SEND-OTP outer error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ message: "Server error", error: isDebug() ? String(err) : undefined });
   }
 };
 
-// VERIFY OTP (no change, but log more)
+/**
+ * VERIFY OTP
+ */
 exports.verifyOtpController = async (req, res) => {
   try {
-    console.log("VERIFY-OTP request body:", req.body);
+    console.log("VERIFY-OTP request body:", { email: !!req.body.email, otpProvided: !!req.body.otp });
+
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required" });
 
-    const storedOtp = otpStore[email];
-    if (!storedOtp) return res.status(400).json({ message: "OTP expired or not found" });
-    if (storedOtp.otp !== otp) return res.status(400).json({ message: "Invalid OTP" });
-    if (Date.now() > storedOtp.expiresAt) { delete otpStore[email]; return res.status(400).json({ message: "OTP expired" }); }
+    const stored = otpStore[email];
+    if (!stored) return res.status(400).json({ message: "OTP expired or not found" });
+    if (Date.now() > stored.expiresAt) {
+      delete otpStore[email];
+      return res.status(400).json({ message: "OTP expired" });
+    }
+    if (stored.otp !== otp) return res.status(400).json({ message: "Invalid OTP" });
 
+    // mark verified
     otpStore[email].verified = true;
-    console.log("OTP Store after verify:", otpStore);
+    // optionally remove otp value to prevent reuse but keep verified flag
+    // delete otpStore[email].otp;
+
+    if (isDebug()) console.log("OTP verified for:", email, "storeSnapshot:", otpStore[email]);
+
     return res.status(200).json({ message: "OTP verified successfully" });
   } catch (error) {
-    console.error("Verify OTP Error:", error);
-    return res.status(500).json({ message: "Error verifying OTP", error: error.message });
+    console.error("VERIFY-OTP Error:", error && error.stack ? error.stack : error);
+    return res.status(500).json({ message: "Error verifying OTP", error: isDebug() ? error.message : undefined });
   }
 };
 
-// RESET PASSWORD (log and minor hardening)
+/**
+ * RESET PASSWORD
+ */
 exports.resetPasswordController = async (req, res) => {
   try {
-    console.log("RESET-PASSWORD request body:", { email: req.body.email ? true : false });
+    console.log("RESET-PASSWORD request body:", { email: !!req.body.email, newPasswordProvided: !!req.body.new_password });
+
     const { email, new_password } = req.body;
     if (!email || !new_password) return res.status(400).json({ message: "Email and new password are required" });
 
     const otpData = otpStore[email];
     if (!otpData || !otpData.verified) return res.status(400).json({ message: "OTP verification required" });
 
+    // basic password policy (example — adjust as needed)
+    if (String(new_password).length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
+
     const hashedPassword = await bcrypt.hash(new_password, 10);
     const result = await users.updateOne({ email }, { $set: { password: hashedPassword } });
 
-    console.log("Password update result:", result);
+    if (isDebug()) console.log("Password update result:", result);
+
+    // remove OTP record
     delete otpStore[email];
+
     return res.status(200).json({ message: "Password reset successful" });
   } catch (error) {
-    console.error("Reset Password Error:", error);
-    return res.status(500).json({ message: "Error resetting password", error: error.message });
+    console.error("RESET-PASSWORD Error:", error && error.stack ? error.stack : error);
+    return res.status(500).json({ message: "Error resetting password", error: isDebug() ? error.message : undefined });
   }
 };
 
