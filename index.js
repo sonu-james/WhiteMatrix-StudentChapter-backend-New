@@ -32,7 +32,7 @@ SCPServer.use(router)
 //second argument -static method to export the folder 
 //static method should have the path of the export folder
 
-// pfServer.use('/uploads',express.static('./uploads'))
+SCPServer.use('/uploads',express.static('./uploads'))
 
 //set port for the server
 PORT = 4000 || process.env.PORT
