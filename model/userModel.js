@@ -38,10 +38,6 @@ const userSchema = new mongoose.Schema({
   track: { type: String, default: "" },
 }, { timestamps: true });
 
-// Case-insensitive unique index
-userSchema.index(
-  { email: 1 },
-  { unique: true, collation: { locale: "en", strength: 2 } }
-);
+
 
 module.exports = mongoose.model("users", userSchema);
